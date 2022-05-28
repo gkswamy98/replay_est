@@ -125,8 +125,8 @@ class Replay():
         sa_pairs_d3 = np.concatenate((self.d3_obs, self.d3_actions), axis=1)
         sa_pairs_d2 = np.concatenate((d2_obs, d2_acts), axis=1)
 
-        self.first_exp_term = f_function.forward(torch.tensor(sa_pairs_d3, dtype=torch.float)).unsqueeze(dim = 1)
-        self.sec_exp_term = f_function.forward(torch.tensor(sa_pairs_d2, dtype=torch.float)).unsqueeze(dim = 1)
+        self.first_exp_term = f_function.forward(torch.tensor(sa_pairs_d3, dtype=torch.float))
+        self.sec_exp_term = f_function.forward(torch.tensor(sa_pairs_d2, dtype=torch.float))
 
         # only need to do this once
         if self.first_alph_comp:
@@ -137,12 +137,12 @@ class Replay():
 
             self.first_alpha_term = (1/combined) * self.first_alpha_term
             self.sec_alpha_term = (1/combined) * self.sec_alpha_term
-
+            print(torch.mean(self.first_alpha_term), torch.mean(self.sec_alpha_term))
             self.first_alph_comp = False
 
-        term_one = torch.mul(torch.unsqueeze(self.first_alpha_term, 1), self.first_exp_term)
-        term_two = torch.mul(torch.unsqueeze(self.sec_alpha_term, 1), self.sec_exp_term)
-
+        term_one = self.first_alpha_term * self.first_exp_term
+        term_two = self.sec_alpha_term * self.sec_exp_term
+        
         return torch.mean(term_one) + torch.mean(term_two)
 
     def sample_and_add(
@@ -201,7 +201,7 @@ class Replay():
         #expert sa pairs for use in the gradient penalty
         expert_obs, expert_acts = make_sa_dataloader(env, max_trajs=n_exp, normalize=False, raw=True, raw_traj=False)
         expert_obs, expert_acts = np.array(expert_obs), np.array(expert_acts)
-        expert_sa_pairs = torch.cat((torch.tensor(expert_obs), torch.tensor(expert_acts)), axis=1)[:batch_size]
+        expert_sa_pairs = torch.cat((torch.tensor(expert_obs), torch.tensor(expert_acts)), axis=1)
 
         #outer steps are maximizing the pseudo reward (f) function and inner steps are the minimization of policy over f
         for outer in range(outer_steps):
@@ -223,7 +223,10 @@ class Replay():
             c = self.cost(pseudoreward, self.d2_obs, self.d2_acts)
             learner_f_under_model = torch.mean(pseudoreward.forward(torch.tensor(sa_samples, dtype=torch.float)))
 
-            gp = gradient_penalty(sa_samples, expert_sa_pairs, pseudoreward)
+            random_sample = np.random.choice(
+                len(expert_obs), len(obs_samples), replace=False)
+            expert_sa_samples = expert_sa_pairs[random_sample]
+            gp = gradient_penalty(sa_samples, expert_sa_samples, pseudoreward)
 
             #Maximize is same as minimize -(obj)
             obj = c - learner_f_under_model + 10 * gp
