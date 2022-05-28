@@ -61,7 +61,7 @@ def train_replay(env, n=0):
 
 def train_rep(env, n=0, bc_steps=0, num_traj=25, seed=0):
     beta = 0.1
-    mu = 1.0
+    mu = 4.0
 
     replay_instance = Replay(OffsetWrapper(gym.make(env)), OffsetWrapper(gym.make(env)), beta, mu)
     action_space_size = gym.make(env).action_space.shape[0]
