@@ -118,7 +118,7 @@ class Replay():
             vals.append(actions)
         distance = np.linalg.norm(np.ptp(np.array(vals), axis=0), axis=1)
 
-        return torch.sigmoid(torch.FloatTensor((distance - self.mu)/self.beta))
+        return torch.sigmoid(torch.FloatTensor((self.mu - distance)/self.beta))
 
 
     def cost(self, f_function, d2_obs, d2_acts):
