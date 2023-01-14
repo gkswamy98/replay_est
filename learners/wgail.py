@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from typing import List, Type
 from pybulletwrapper import OffsetWrapper
+from noisywrapper import NoisyWrapper
 
 def create_mlp(
     input_dim: int, output_dim: int, net_arch: List[int], activation_fn: Type[nn.Module] = nn.ReLU) -> List[nn.Module]:
@@ -45,37 +46,31 @@ class WGAIL():
         env,
         policy,
         trajs,
-        max_path_length=np.inf,
     ):
         # rollout trajectories using a policy and add to replay buffer
         observations = []
         actions = []
-        path_length = 0
-        obs = env.reset()
         total_trajs = 0
+        steps = 0
         while total_trajs < trajs:
-            while path_length < max_path_length:
+            obs = env.reset()
+            done = False
+            while not done:
                 observations.append(obs)
                 act = policy.predict(obs)[0]
                 actions.append(act)
-                obs, _, d, _ = env.step(act)
-
-                path_length += 1
-
-                if d:
+                steps += 1
+                obs, _, done, _ = env.step(act)
+                if done:
                     total_trajs += 1
-                    o = o = env.reset()
                     break
-            if not d:
-                total_trajs += 1
         self.replay_buffer.add(observations, actions)
-
-        return
+        return steps
 
     def train(self, expert_sa_pairs, expert_obs, expert_acts, n_seed=0, n_exp=25):
-        learn_rate = 8e-5
-        outer_steps = 160
-        inner_steps = 2500
+        learn_rate = 8e-3 
+        outer_steps = 81
+        inner_steps = 5000
         save_inner_model = False
         num_traj_sample = 4
         batch_size = 2048
@@ -103,19 +98,22 @@ class WGAIL():
 
         for outer in range(outer_steps):
             # update policy
+            if not outer == 0:
+                learning_rate_used = learn_rate/outer
+            else:
+                learning_rate_used = learn_rate
+            f_net_optimizer = OAdam(f_net.parameters(), lr=learning_rate_used)
+            
             model.learn(total_timesteps=inner_steps, log_interval=1000)
 
             if save_inner_model:
                 model.save("sac_mimicmd_training_model")
 
-            # sample some more sa pairs using current model
-            self.sample_and_add(wrapped_env, model, num_traj_sample)
-
             # sample from replay buffer
             low = wrapped_env.action_space.low
             high = wrapped_env.action_space.high
-            tuple_samples = self.replay_buffer.sample(batch_size)
-            obs_samples, act_samples = tuple_samples[0], tuple_samples[1]
+            tuple_samples = model.replay_buffer.sample(batch_size)
+            obs_samples, act_samples = tuple_samples[0].cpu(), tuple_samples[1].cpu()
             act_samples = (((act_samples - low) / (high - low)) * 2.0) - 1.0
             sa_samples = torch.cat(
                 (torch.tensor(obs_samples), torch.tensor(act_samples)), axis=1)
@@ -137,19 +135,17 @@ class WGAIL():
             obj = cost_value - learner_f_under_model + 10 * gp
             obj.backward()
 
-            prog = outer/outer_steps
-            if prog > 0.1:
-                torch.nn.utils.clip_grad_norm(f_net.parameters(), 40.0)
             f_net_optimizer.step()
 
             # evaluate performance
-            mean_reward, std_reward = evaluate_policy(
-                model, OffsetWrapper(gym.make(self.env)), n_eval_episodes=10)
-            mean_rewards.append(mean_reward)
-            std_rewards.append(std_reward)
+            if outer % 5 == 0:
+                mean_reward, std_reward = evaluate_policy(
+                    model, OffsetWrapper(gym.make(self.env)), n_eval_episodes=10)
+                mean_rewards.append(mean_reward)
+                std_rewards.append(std_reward)
             print("{0} Iteration: {1}".format(outer, mean_reward))
             if save_rewards:
-                np.savez(os.path.join("learners", self.env, "wgail_rewards_{0}_{1}_{2}".format(n_exp, n_seed,
+                np.savez(os.path.join("learners", self.env, "off_mm_rewards_{0}_{1}_{2}".format(n_exp, n_seed,
                                                                                                outer)), means=mean_rewards, stds=std_rewards)
 
 
@@ -184,54 +180,6 @@ class WGAILReplayBuffer():
     def sample(self, batch):
         indexes = np.random.choice(range(self.size), batch)
         return self.obs[indexes], self.actions[indexes]
-
-
-class WGAILPolicy(nn.Module):
-    def __init__(self, env, mean=None, std=None):
-        super(WGAILPolicy, self).__init__()
-        if isinstance(env.action_space, Discrete):
-            self.net_arch = [64, 64]
-            self.action_dim = env.action_space.n
-            self.discrete = True
-        else:
-            self.net_arch = [256, 256]
-            self.action_dim = int(np.prod(env.action_space.shape))
-            self.low = torch.as_tensor(env.action_space.low)
-            self.high = torch.as_tensor(env.action_space.high)
-            self.discrete = False
-        self.obs_dim = int(np.prod(env.observation_space.shape))
-        self.observation_space = env.observation_space
-        net = create_mlp(self.obs_dim, self.action_dim, self.net_arch, nn.ReLU)
-        if self.discrete:
-            net.append(nn.Softmax(dim=1))
-        self.net = nn.Sequential(*net)
-        self.net.apply(init_ortho)
-        if mean is not None and std is not None:
-            self.mean = mean
-            self.std = std
-            self.is_normalized = True
-        else:
-            self.is_normalized = False
-
-    def forward(self, obs):
-        action = self.net(obs)
-        return action
-
-    def predict(self, obs, state, mask, deterministic):
-        obs = obs.reshape((-1,) + (self.obs_dim,))
-        if self.is_normalized:
-            obs = (obs - self.mean) / self.std
-        obs = torch.as_tensor(obs)
-        with torch.no_grad():
-            actions = self.forward(obs)
-            if self.discrete:
-                actions = actions.argmax(dim=1).reshape(-1)
-            else:
-                actions = self.low + ((actions + 1.0) /
-                                      2.0) * (self.high - self.low)
-                actions = torch.max(torch.min(actions, self.high), self.low)
-            actions = actions.cpu().numpy()
-        return actions, state
 
 
 class WGAILDiscriminator(nn.Module):

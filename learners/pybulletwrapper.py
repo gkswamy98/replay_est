@@ -3,7 +3,7 @@ import numpy as np
 
 class OffsetWrapper(gym.Env):
     metadata = {'render.modes': ['human']}
-    def __init__(self, base_env, sigma=0.001):
+    def __init__(self, base_env, sigma=1e-7):
         super(OffsetWrapper, self).__init__()
         self.base_env = base_env
         self.observation_space = self.base_env.observation_space

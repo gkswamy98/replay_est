@@ -16,6 +16,7 @@ from typing import List, Type
 from pybulletwrapper import OffsetWrapper
 from optim import OAdam
 from envwrapper import BasicWrapper
+from bc import *
 
 def create_mlp(
     input_dim: int, output_dim: int, net_arch: List[int], activation_fn: Type[nn.Module] = nn.ReLU) -> List[nn.Module]:
@@ -53,7 +54,7 @@ class Replay():
         self.bc_nets = []
         
 
-    def train_ensemble(self, w, env, d1_size, bc_steps, load=False, num_trajs=None, n_ensemb=3):
+    def train_ensemble(self, w, env, d1_size, bc_steps, load=False, num_trajs=None, n_ensemb=5):
         #This function runs step 2 and trains BC on D_1 to learn a query policy
         mean_rewards = []
         std_rewards = []
@@ -66,25 +67,25 @@ class Replay():
                 std_rewards = []
 
                 expert_data = make_sa_dataloader(env, max_trajs=num_trajs, normalize=False)
-                bc_trainer = bc.BC(gym.make(env).observation_space, gym.make(env).action_space, expert_data=expert_data,
-                                    policy_class=policies.ActorCriticPolicy,
-                                    ent_weight=0., l2_weight=0., policy_kwargs=dict(net_arch=[w, w]))
-
-                bc_trainer.train(n_epochs=int(bc_steps))
+                test_env = gym.make(env)
+                model = SAC('MlpPolicy', test_env, verbose=1, policy_kwargs=dict(net_arch=[256, 256]), device="cuda:0")
+                policy = BC(expert_data, model.policy.actor, steps=int(1e5))
 
                 def get_policy(*args, **kwargs):
-                    return bc_trainer.policy
+                    return policy
                 model = PPO(get_policy, env, verbose=1)
                 model.save(os.path.join("learners", env,
                                         "bc_query_{0}_{1}".format(num_trajs, i)))
-                mean_reward, std_reward = evaluate_policy(model, self.eval_env, n_eval_episodes=10)
-                mean_rewards.append(mean_reward)
-                std_rewards.append(std_reward)
-                print("BC Net Reward: {0}".format(mean_rewards))
+
 
             model = PPO.load(os.path.join("learners", env, "bc_query_{0}_{1}").format(num_trajs, i))
+            mean_reward, std_reward = evaluate_policy(model, self.eval_env, n_eval_episodes=10)
+            mean_rewards.append(mean_reward)
+            std_rewards.append(std_reward)
+            print("BC Net Reward: {0}".format(mean_rewards))
             print("loaded model")
             self.bc_nets.append(model)
+        self.bc_nets = [x for y, x in sorted(zip(mean_rewards, self.bc_nets), reverse=True)]
 
 
     def generate_d3(self, env, target_samps, load, num_traj=None):
@@ -95,9 +96,10 @@ class Replay():
             print("loaded d3", len(self.d3_obs))
         else:
             env_to_eval = self.base_env
-            model = self.bc_nets[0]
+            model = self.bc_nets[-1]
 
             cur_obs, cur_acts = [], []
+            J = 0
             for _ in range(target_samps):
                 obs = env_to_eval.reset()
                 done = False
@@ -106,10 +108,13 @@ class Replay():
                     action, _ = model.predict(obs, state=None, deterministic=True)
                     cur_acts.append(action)
                     obs, reward, done, _ = env_to_eval.step(action)
+                    J += reward
 
             self.d3_obs = cur_obs
             self.d3_actions = cur_acts
-            np.savez("learners/{0}/d3_samps_{1}.npz".format(env, num_traj), obs = self.d3_obs, acts = self.d3_actions)
+            mean_J = J / target_samps
+            print(mean_J)
+            np.savez("learners/{0}/d3_samps_{1}.npz".format(env, num_traj), obs = self.d3_obs, acts = self.d3_actions, mean_J = mean_J)
 
     def alpha_func(self, states):
         vals = []
@@ -137,7 +142,7 @@ class Replay():
 
             self.first_alpha_term = (1/combined) * self.first_alpha_term
             self.sec_alpha_term = (1/combined) * self.sec_alpha_term
-            print(torch.mean(self.first_alpha_term), torch.mean(self.sec_alpha_term))
+            print('bc weight', torch.mean(self.first_alpha_term), 'exp weight', torch.mean(self.sec_alpha_term))
             self.first_alph_comp = False
 
         term_one = self.first_alpha_term * self.first_exp_term
@@ -150,35 +155,31 @@ class Replay():
         env,
         policy,
         trajs,
-        max_path_length=np.inf,
     ):
         #rollout trajectories using a policy and add to replay buffer
         observations = []
         actions = []
-        path_length = 0
-        obs = env.reset()
         total_trajs = 0
+        steps = 0
         while total_trajs < trajs:
-            while path_length < max_path_length:
+            obs = env.reset()
+            done = False
+            while not done:
                 observations.append(obs)
                 act = policy.predict(obs)[0]
                 actions.append(act)
-                obs, _, d, _ = env.step(act)
-
-                path_length += 1
-
-                if d:
-                    total_trajs+=1
-                    o = o = env.reset()
+                steps += 1
+                obs, _, done, _ = env.step(act)
+                if done:
+                    total_trajs += 1
                     break
-            if not d:
-                total_trajs+=1
         self.replay_buffer.add(observations, actions)
+        return steps
 
     def train(self, env, n_seed=0, n_exp=25):
-        learn_rate = 8e-5
-        outer_steps = 160
-        inner_steps = 2500
+        learn_rate = 8e-3
+        outer_steps = 81
+        inner_steps = 5000
         num_traj_sample = 4
         batch_size = 2048
         mean_rewards = []
@@ -205,13 +206,19 @@ class Replay():
 
         #outer steps are maximizing the pseudo reward (f) function and inner steps are the minimization of policy over f
         for outer in range(outer_steps):
+            if not outer == 0:
+                learning_rate_used = learn_rate/outer
+            else:
+                learning_rate_used = learn_rate
+            pseudoreward_optimizer = OAdam(pseudoreward.parameters(), lr=learning_rate_used)
+            
             model.learn(total_timesteps=inner_steps, log_interval=5000)
-            self.sample_and_add(wrapped_env, model, num_traj_sample)
 
             #sample from replay buffer
             low = wrapped_env.action_space.low
             high = wrapped_env.action_space.high
-            obs_samples, act_samples = replay_buffer.sample(batch_size)
+            tuple_samples = model.replay_buffer.sample(batch_size)
+            obs_samples, act_samples = tuple_samples[0].cpu(), tuple_samples[1].cpu()
             act_samples = (((act_samples - low) / (high - low)) * 2.0) - 1.0
             sa_samples = torch.cat((torch.tensor(obs_samples), torch.tensor(act_samples)), axis=1)
 
@@ -232,17 +239,16 @@ class Replay():
             obj = c - learner_f_under_model + 10 * gp
             obj.backward()
 
-            if prog > 0.1:
-                torch.nn.utils.clip_grad_norm(pseudoreward.parameters(), 40.0)
             pseudoreward_optimizer.step()
 
             #evaluate performance
-            mean_reward, std_reward = evaluate_policy(
-                model, self.eval_env, n_eval_episodes=10)
-            mean_rewards.append(mean_reward)
-            std_rewards.append(std_reward)
+            if outer % 5 == 0:
+                mean_reward, std_reward = evaluate_policy(
+                    model, self.eval_env, n_eval_episodes=10)
+                mean_rewards.append(mean_reward)
+                std_rewards.append(std_reward)
             print("{0} Iteration: {1}".format(outer, mean_reward))
-            np.savez(os.path.join("learners", env, "replay_rewards_{0}_{1}_{2}".format(
+            np.savez(os.path.join("learners", env, "redo_replay_rewards_{0}_{1}_{2}".format(
                     n_exp, n_seed, outer)), means=mean_rewards, stds=std_rewards)
 
 
@@ -277,50 +283,6 @@ class ReplayBuffer():
     def sample(self, batch):
         indexes = np.random.choice(range(self.size), batch)
         return self.obs[indexes], self.actions[indexes]
-
-class ReplayPolicy(nn.Module):
-    def __init__(self, env, mean=None, std=None):
-        super(ReplayPolicy, self).__init__()
-        if isinstance(env.action_space, Discrete):
-            self.net_arch = [64, 64]
-            self.action_dim = env.action_space.n
-            self.discrete = True
-        else:
-            self.net_arch = [256, 256]
-            self.action_dim = int(np.prod(env.action_space.shape))
-            self.low = torch.as_tensor(env.action_space.low)
-            self.high = torch.as_tensor(env.action_space.high)
-            self.discrete = False
-        self.obs_dim = int(np.prod(env.observation_space.shape))
-        self.observation_space = env.observation_space
-        net = create_mlp(self.obs_dim, self.action_dim, self.net_arch, nn.ReLU)
-        if self.discrete:
-            net.append(nn.Softmax(dim=1))
-        self.net = nn.Sequential(*net)
-        self.net.apply(init_ortho)
-        if mean is not None and std is not None:
-            self.mean = mean
-            self.std = std
-            self.is_normalized = True
-        else:
-            self.is_normalized = False
-    def forward(self, obs):
-        action = self.net(obs)
-        return action
-    def predict(self, obs, state, mask, deterministic):
-        obs = obs.reshape((-1,) + (self.obs_dim,))
-        if self.is_normalized:
-            obs = (obs - self.mean) / self.std
-        obs = torch.as_tensor(obs)
-        with torch.no_grad():
-            actions = self.forward(obs)
-            if self.discrete:
-                actions = actions.argmax(dim=1).reshape(-1)
-            else:
-                actions = self.low + ((actions + 1.0) / 2.0) * (self.high - self.low)
-                actions = torch.max(torch.min(actions, self.high), self.low)
-            actions = actions.cpu().numpy()
-        return actions, state
 
 class ReplayDiscriminator(nn.Module):
     def __init__(self, env):

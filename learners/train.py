@@ -10,12 +10,14 @@ import os
 import gym
 import pybullet_envs
 from pybulletwrapper import OffsetWrapper
+from noisywrapper import *
 from wgail import *
 from replay import *
+from bc import *
+import inspect
 
 def train_bc(env, n=0):
     venv = util.make_vec_env(env, n_envs=8)
-    w = 256
     for i in range(n):
         mean_rewards = []
         std_rewards = []
@@ -24,19 +26,18 @@ def train_bc(env, n=0):
                 expert_data = make_sa_dataloader(env, normalize=False)
             else:
                 expert_data = make_sa_dataloader(env, max_trajs=num_trajs, normalize=False)
-            bc_trainer = bc.BC(observation_space=venv.observation_space, action_space=venv.action_space, expert_data=expert_data,
-                               policy_class=policies.ActorCriticPolicy,
-                               ent_weight=0., l2_weight=0., policy_kwargs=dict(net_arch=[w, w]))
+            
+            test_env = gym.make(env)
+            model = SAC('MlpPolicy', test_env, verbose=1, policy_kwargs=dict(net_arch=[256, 256]), device="cuda:0")
             if num_trajs > 0:
-                bc_trainer.train(n_epochs=int(1e5/100))
+                policy = BC(expert_data, model.policy.actor, steps=int(1e5))
 
             def get_policy(*args, **kwargs):
-                return bc_trainer.policy
+                return policy
             model = PPO(get_policy, env, verbose=1)
             model.save(os.path.join("learners", env,
                                     "bc_{0}_{1}".format(i, num_trajs)))
-            test_env = gym.make(env)
-            test_env = OffsetWrapper(test_env)
+            test_env = NoisyWrapper(test_env)
             mean_reward, std_reward = evaluate_policy(
                     model, test_env, n_eval_episodes=10)               
             mean_rewards.append(mean_reward)
@@ -61,17 +62,22 @@ def train_replay(env, n=0):
 
 def train_rep(env, n=0, bc_steps=0, num_traj=25, seed=0):
     beta = 0.1
-    mu = 4.0
+    mu = 0.35
 
-    replay_instance = Replay(OffsetWrapper(gym.make(env)), OffsetWrapper(gym.make(env)), beta, mu)
+    replay_instance = Replay(NoisyWrapper(gym.make(env)), NoisyWrapper(gym.make(env)), beta, mu)
     action_space_size = gym.make(env).action_space.shape[0]
     obs_space_size = gym.make(env).observation_space.shape[0]
-
+    
     # 1. Generate D1 and D2.
-    ratio_d1_d2 = 2.0/num_traj
+    if num_traj == 6:
+        ratio_d1_d2 = 2/6
+    elif num_traj == 12:
+        ratio_d1_d2 = 2/12
+    elif num_traj == 18:
+        ratio_d1_d2 = 2/18
     traj_numbers = list(range(num_traj))
     d1_size = traj_numbers[:int(num_traj*ratio_d1_d2)]
-    d2_size = traj_numbers[int(num_traj*ratio_d1_d2):]
+    d2_size = traj_numbers
 
     d1_obs, d1_acts = make_sa_dataloader(env, max_trajs=d1_size, normalize=False, raw=True, raw_traj=False)
     d2_obs, d2_acts = make_sa_dataloader(env, max_trajs=d2_size, normalize=False, raw=True, raw_traj=False)

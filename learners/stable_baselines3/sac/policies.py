@@ -252,6 +252,7 @@ class SACPolicy(BasePolicy):
         )
 
         self.optimizer_class = OAdam
+        print("Using Optimistic SAC")
 
 
         if net_arch is None:
